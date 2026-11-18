@@ -1,0 +1,299 @@
+﻿"""Independent RAD-DAES hardware integration engine for S.P.E.C.T.R.A."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields, is_dataclass, asdict
+from pathlib import Path
+import inspect
+
+import numpy as np
+import yaml
+
+from rad_daes.adaptation.daes import DAESController
+from rad_daes.background.model import BackgroundModel
+
+
+@dataclass
+class EngineResult:
+    sample: int
+    score: float
+    threshold: float
+    alarm: bool
+    telemetry_valid: bool
+    adaptation_allowed: bool
+    adaptation_applied: bool
+    eta: float
+    firmware_gate: int
+    reason: str
+
+
+def _flatten(value, prefix=""):
+    result = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            result.update(_flatten(item, name))
+    else:
+        result[prefix.split(".")[-1]] = value
+    return result
+
+
+class SpectraRADEngine:
+    """Hardware-specific wrapper around the original RAD-DAES controller."""
+
+    def __init__(
+        self,
+        model: BackgroundModel,
+        config_path: str | Path,
+        threshold: float = 22.46,
+        persistence: int = 2,
+    ):
+        self.model = model
+        self.threshold = float(threshold)
+        self.persistence = int(persistence)
+
+        if self.persistence < 1:
+            raise ValueError("Persistence must be at least one.")
+
+        self.config_path = Path(config_path)
+        with self.config_path.open("r", encoding="utf-8") as f:
+            config = _flatten(yaml.safe_load(f) or {})
+
+        self.gain = float(config.get("gain", 0.35))
+        self.safety = float(config.get("safety", 0.10))
+
+        defaults = {
+            "gain": self.gain,
+            "safety": self.safety,
+            "power_iterations": int(config.get("power_iterations", 7)),
+            "tracker_alpha": float(config.get("tracker_alpha", 0.16)),
+            "tracker_alpha_max": float(config.get("tracker_alpha_max", 0.82)),
+            "drift_sensitivity": float(config.get("drift_sensitivity", 7.0)),
+            "initial_vector": config.get(
+                "initial_vector", [0.83, 0.41, 0.37, 0.29, 0.23, 0.19]
+            ),
+        }
+
+        signature = inspect.signature(DAESController)
+        accepted = {
+            key: value for key, value in defaults.items()
+            if key in signature.parameters
+        }
+        self.controller = DAESController(**accepted)
+
+        self.mean = np.asarray(model.mean, dtype=float).copy()
+        self.covariance = np.asarray(model.covariance, dtype=float).copy()
+
+        if self.mean.shape != (6,) or self.covariance.shape != (6, 6):
+            raise ValueError("Expected a six-channel background model.")
+
+        if not np.all(np.isfinite(self.mean)):
+            raise ValueError("Background mean is not finite.")
+
+        if not np.all(np.isfinite(self.covariance)):
+            raise ValueError("Background covariance is not finite.")
+
+        self.covariance = 0.5 * (self.covariance + self.covariance.T)
+        if np.linalg.eigvalsh(self.covariance).min() <= 0:
+            raise ValueError("Background covariance must be positive definite.")
+
+        self.model.mean = self.mean.copy()
+        self.model.covariance = self.covariance.copy()
+
+        self.consecutive_exceedances = 0
+        self.last_score = 0.0
+        self.processed = 0
+        self.adaptations = 0
+        self.alarms = 0
+
+        precision = np.linalg.inv(self.covariance)
+        self.controller.reset(precision)
+
+    def _score(self, observation):
+        delta = observation - self.mean
+        solved = np.linalg.solve(self.covariance, delta)
+        return max(0.0, float(delta @ solved))
+
+    def _step_size(self, precision):
+        result = self.controller.step(precision)
+
+        # Normalize the original controller's DAESStep result.
+        if isinstance(result, dict):
+            values = result
+        elif is_dataclass(result):
+            values = asdict(result)
+        elif hasattr(result, "__dict__"):
+            values = vars(result)
+        else:
+            values = {}
+
+        aliases = ("eta", "step_size", "learning_rate", "step", "lr")
+        value = next(
+            (values[key] for key in aliases if key in values),
+            None,
+        )
+
+        if value is None:
+            for key in aliases:
+                if hasattr(result, key):
+                    value = getattr(result, key)
+                    break
+
+        if value is None:
+            available = list(values.keys())
+            raise TypeError(
+                "Unknown DAESStep structure. Available fields: "
+                f"{available}; object={result!r}"
+            )
+
+        eta = float(np.asarray(value).reshape(-1)[0])
+
+        if not np.isfinite(eta) or eta <= 0:
+            raise RuntimeError(f"DAES returned invalid step size: {eta}")
+
+        return min(eta, 0.05)
+
+    def process(self, packet) -> EngineResult:
+        x = np.asarray(packet.channels, dtype=float)
+
+        if x.shape != (6,):
+            raise ValueError("Expected exactly six channel observations.")
+
+        if not np.all(np.isfinite(x)) or np.any(x < 0):
+            raise ValueError("Invalid channel observations.")
+
+        self.processed += 1
+
+        # Score against the background BEFORE any update.
+        score = self._score(x)
+        self.last_score = score
+
+        if score >= self.threshold:
+            self.consecutive_exceedances += 1
+        else:
+            self.consecutive_exceedances = 0
+
+        alarm = self.consecutive_exceedances >= self.persistence
+
+        timing_ok = 500 <= int(packet.interval_ms) <= 1500
+        firmware_ok = int(packet.firmware_gate) == 0
+
+        telemetry_valid = timing_ok and firmware_ok
+
+        reasons = []
+
+        if not timing_ok:
+            reasons.append("TIMING_INVALID")
+
+        if int(packet.firmware_gate) == 1:
+            reasons.append("FIRMWARE_FAULT")
+
+        if int(packet.firmware_gate) == 2:
+            reasons.append("FIRMWARE_HOLD")
+
+        if alarm:
+            reasons.append("ANOMALY_ALARM")
+
+        if int(packet.source):
+            reasons.append("SOURCE_INJECTION")
+
+        if int(packet.fault):
+            reasons.append("FAULT_INJECTION")
+
+        if int(packet.mode) != 1:
+            reasons.append("STATIC_MODE")
+
+        adaptation_allowed = (
+            telemetry_valid
+            and not alarm
+            and int(packet.source) == 0
+            and int(packet.fault) == 0
+            and int(packet.mode) == 1
+        )
+
+        eta = 0.0
+        adaptation_applied = False
+
+        if adaptation_allowed:
+            precision = np.linalg.inv(self.covariance)
+            eta = self._step_size(precision)
+
+            residual = x - self.mean
+
+            # Keep the covariance floor anchored to calibration.
+            if not hasattr(self, "covariance_floor"):
+                initial_min_eig = float(
+                    np.linalg.eigvalsh(self.covariance).min()
+                )
+                self.covariance_floor = max(
+                    1e-6, initial_min_eig * 0.10
+                )
+
+            # Effective integration rate is deliberately bounded.
+            alpha = min(float(eta), 0.05)
+
+            # Exponentially weighted mean update.
+            new_mean = self.mean + alpha * residual
+
+            # Weighted covariance update around the updated mean.
+            new_covariance = (
+                (1.0 - alpha) * self.covariance
+                + alpha * (1.0 - alpha)
+                * np.outer(residual, residual)
+            )
+
+            new_covariance = 0.5 * (
+                new_covariance + new_covariance.T
+            )
+
+            # Project onto a positive-definite covariance matrix.
+            eigenvalues, eigenvectors = np.linalg.eigh(new_covariance)
+            eigenvalues = np.maximum(
+                eigenvalues, self.covariance_floor
+            )
+
+            new_covariance = (
+                eigenvectors
+                @ np.diag(eigenvalues)
+                @ eigenvectors.T
+            )
+
+            new_covariance = 0.5 * (
+                new_covariance + new_covariance.T
+            )
+
+            if (
+                np.all(np.isfinite(new_mean))
+                and np.all(np.isfinite(new_covariance))
+                and np.linalg.eigvalsh(new_covariance).min() >= self.covariance_floor * 0.999
+            ):
+                self.mean = new_mean
+                self.covariance = new_covariance
+
+                self.model.mean = self.mean.copy()
+                self.model.covariance = self.covariance.copy()
+
+                self.adaptations += 1
+                adaptation_applied = True
+            else:
+                reasons.append("UPDATE_REJECTED")
+
+        if alarm:
+            self.alarms += 1
+
+        if not reasons:
+            reasons.append("CLEAN_ADAPT" if adaptation_applied else "CLEAN_HOLD")
+
+        return EngineResult(
+            sample=int(packet.sample),
+            score=score,
+            threshold=self.threshold,
+            alarm=alarm,
+            telemetry_valid=telemetry_valid,
+            adaptation_allowed=adaptation_allowed,
+            adaptation_applied=adaptation_applied,
+            eta=eta,
+            firmware_gate=int(packet.firmware_gate),
+            reason="|".join(reasons),
+        )
+

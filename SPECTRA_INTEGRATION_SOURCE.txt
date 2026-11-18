@@ -1,0 +1,1501 @@
+S.P.E.C.T.R.A. COMPLETE INTEGRATION SOURCE
+Generated: 2026-11-17 01:08:01
+Workspace: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\tools\run_engine.py
+===========================================================================
+"""Live S.P.E.C.T.R.A. RAD-DAES hardware-in-the-loop runner."""
+
+from __future__ import annotations
+
+import csv
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+
+from communication.serial.serial_reader import SpectraSerialReader
+from rad_daes.background.model import BackgroundModel
+from spectra_app.engine import SpectraRADEngine
+
+
+def main():
+    root = Path(__file__).resolve().parents[1]
+    repo = Path.cwd()
+
+    model_dir = root / "data" / "processed"
+    export_dir = root / "data" / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    models = sorted(
+        model_dir.glob("background_model_*.npz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not models:
+        raise FileNotFoundError("No calibrated background model found.")
+
+    config_path = repo / "configs" / "model.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"RAD-DAES config not found: {config_path}")
+
+    with np.load(models[0], allow_pickle=False) as data:
+        mean = data["mean"].astype(float)
+        covariance = data["covariance"].astype(float)
+
+    model = BackgroundModel(mean=mean, covariance=covariance)
+    engine = SpectraRADEngine(model, config_path)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = export_dir / f"spectra_engine_{stamp}.csv"
+
+    fields = [
+        "sample", "score", "threshold", "alarm",
+        "telemetry_valid", "adaptation_allowed",
+        "adaptation_applied", "eta", "firmware_gate", "reason",
+    ]
+
+    reader = SpectraSerialReader("COM4", 115200, timeout=3.0)
+
+    print("\n========== S.P.E.C.T.R.A. RAD-DAES ENGINE ==========")
+    print("Model:", models[0])
+    print("Config:", config_path)
+    print("Alarm threshold:", engine.threshold)
+    print("Persistence:", engine.persistence)
+    print("Opening COM4. Press Ctrl+C to stop.\n")
+
+    try:
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            reader.connect()
+
+            for packet in reader.stream():
+                result = engine.process(packet)
+
+                row = {
+                    "sample": result.sample,
+                    "score": result.score,
+                    "threshold": result.threshold,
+                    "alarm": result.alarm,
+                    "telemetry_valid": result.telemetry_valid,
+                    "adaptation_allowed": result.adaptation_allowed,
+                    "adaptation_applied": result.adaptation_applied,
+                    "eta": result.eta,
+                    "firmware_gate": result.firmware_gate,
+                    "reason": result.reason,
+                }
+
+                writer.writerow(row)
+                f.flush()
+
+                status = "ALARM" if result.alarm else "NORMAL"
+
+                print(
+                    f"Sample={result.sample} | "
+                    f"M2={result.score:.3f} | "
+                    f"{status} | "
+                    f"Adapt={result.adaptation_applied} | "
+                    f"eta={result.eta:.6f} | "
+                    f"{result.reason}"
+                )
+
+    except KeyboardInterrupt:
+        print("\nEngine stopped by user.")
+
+    finally:
+        reader.close()
+
+    print("\n========== ENGINE SESSION SUMMARY ==========")
+    print("Processed:", engine.processed)
+    print("Adaptations:", engine.adaptations)
+    print("Alarms:", engine.alarms)
+    print("Final mean:", np.round(engine.mean, 4))
+    print("Log:", log_path)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"\nENGINE FAILED: {type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\spectra_app\engine.py
+===========================================================================
+"""Independent RAD-DAES hardware integration engine for S.P.E.C.T.R.A."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields, is_dataclass, asdict
+from pathlib import Path
+import inspect
+
+import numpy as np
+import yaml
+
+from rad_daes.adaptation.daes import DAESController
+from rad_daes.background.model import BackgroundModel
+
+
+@dataclass
+class EngineResult:
+    sample: int
+    score: float
+    threshold: float
+    alarm: bool
+    telemetry_valid: bool
+    adaptation_allowed: bool
+    adaptation_applied: bool
+    eta: float
+    firmware_gate: int
+    reason: str
+
+
+def _flatten(value, prefix=""):
+    result = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            result.update(_flatten(item, name))
+    else:
+        result[prefix.split(".")[-1]] = value
+    return result
+
+
+class SpectraRADEngine:
+    """Hardware-specific wrapper around the original RAD-DAES controller."""
+
+    def __init__(
+        self,
+        model: BackgroundModel,
+        config_path: str | Path,
+        threshold: float = 22.46,
+        persistence: int = 2,
+    ):
+        self.model = model
+        self.threshold = float(threshold)
+        self.persistence = int(persistence)
+
+        if self.persistence < 1:
+            raise ValueError("Persistence must be at least one.")
+
+        self.config_path = Path(config_path)
+        with self.config_path.open("r", encoding="utf-8") as f:
+            config = _flatten(yaml.safe_load(f) or {})
+
+        self.gain = float(config.get("gain", 0.35))
+        self.safety = float(config.get("safety", 0.10))
+
+        defaults = {
+            "gain": self.gain,
+            "safety": self.safety,
+            "power_iterations": int(config.get("power_iterations", 7)),
+            "tracker_alpha": float(config.get("tracker_alpha", 0.16)),
+            "tracker_alpha_max": float(config.get("tracker_alpha_max", 0.82)),
+            "drift_sensitivity": float(config.get("drift_sensitivity", 7.0)),
+            "initial_vector": config.get(
+                "initial_vector", [0.83, 0.41, 0.37, 0.29, 0.23, 0.19]
+            ),
+        }
+
+        signature = inspect.signature(DAESController)
+        accepted = {
+            key: value for key, value in defaults.items()
+            if key in signature.parameters
+        }
+        self.controller = DAESController(**accepted)
+
+        self.mean = np.asarray(model.mean, dtype=float).copy()
+        self.covariance = np.asarray(model.covariance, dtype=float).copy()
+
+        if self.mean.shape != (6,) or self.covariance.shape != (6, 6):
+            raise ValueError("Expected a six-channel background model.")
+
+        if not np.all(np.isfinite(self.mean)):
+            raise ValueError("Background mean is not finite.")
+
+        if not np.all(np.isfinite(self.covariance)):
+            raise ValueError("Background covariance is not finite.")
+
+        self.covariance = 0.5 * (self.covariance + self.covariance.T)
+        if np.linalg.eigvalsh(self.covariance).min() <= 0:
+            raise ValueError("Background covariance must be positive definite.")
+
+        self.model.mean = self.mean.copy()
+        self.model.covariance = self.covariance.copy()
+
+        self.consecutive_exceedances = 0
+        self.last_score = 0.0
+        self.processed = 0
+        self.adaptations = 0
+        self.alarms = 0
+
+        precision = np.linalg.inv(self.covariance)
+        self.controller.reset(precision)
+
+    def _score(self, observation):
+        delta = observation - self.mean
+        solved = np.linalg.solve(self.covariance, delta)
+        return max(0.0, float(delta @ solved))
+
+    def _step_size(self, precision):
+        result = self.controller.step(precision)
+
+        # Normalize the original controller's DAESStep result.
+        if isinstance(result, dict):
+            values = result
+        elif is_dataclass(result):
+            values = asdict(result)
+        elif hasattr(result, "__dict__"):
+            values = vars(result)
+        else:
+            values = {}
+
+        aliases = ("eta", "step_size", "learning_rate", "step", "lr")
+        value = next(
+            (values[key] for key in aliases if key in values),
+            None,
+        )
+
+        if value is None:
+            for key in aliases:
+                if hasattr(result, key):
+                    value = getattr(result, key)
+                    break
+
+        if value is None:
+            available = list(values.keys())
+            raise TypeError(
+                "Unknown DAESStep structure. Available fields: "
+                f"{available}; object={result!r}"
+            )
+
+        eta = float(np.asarray(value).reshape(-1)[0])
+
+        if not np.isfinite(eta) or eta <= 0:
+            raise RuntimeError(f"DAES returned invalid step size: {eta}")
+
+        return min(eta, 0.05)
+
+    def process(self, packet) -> EngineResult:
+        x = np.asarray(packet.channels, dtype=float)
+
+        if x.shape != (6,):
+            raise ValueError("Expected exactly six channel observations.")
+
+        if not np.all(np.isfinite(x)) or np.any(x < 0):
+            raise ValueError("Invalid channel observations.")
+
+        self.processed += 1
+
+        # Score against the background BEFORE any update.
+        score = self._score(x)
+        self.last_score = score
+
+        if score >= self.threshold:
+            self.consecutive_exceedances += 1
+        else:
+            self.consecutive_exceedances = 0
+
+        alarm = self.consecutive_exceedances >= self.persistence
+
+        timing_ok = 500 <= int(packet.interval_ms) <= 1500
+        firmware_ok = int(packet.firmware_gate) == 0
+
+        telemetry_valid = timing_ok and firmware_ok
+
+        reasons = []
+
+        if not timing_ok:
+            reasons.append("TIMING_INVALID")
+
+        if int(packet.firmware_gate) == 1:
+            reasons.append("FIRMWARE_FAULT")
+
+        if int(packet.firmware_gate) == 2:
+            reasons.append("FIRMWARE_HOLD")
+
+        if alarm:
+            reasons.append("ANOMALY_ALARM")
+
+        if int(packet.source):
+            reasons.append("SOURCE_INJECTION")
+
+        if int(packet.fault):
+            reasons.append("FAULT_INJECTION")
+
+        if int(packet.mode) != 1:
+            reasons.append("STATIC_MODE")
+
+        adaptation_allowed = (
+            telemetry_valid
+            and not alarm
+            and int(packet.source) == 0
+            and int(packet.fault) == 0
+            and int(packet.mode) == 1
+        )
+
+        eta = 0.0
+        adaptation_applied = False
+
+        if adaptation_allowed:
+            precision = np.linalg.inv(self.covariance)
+            eta = self._step_size(precision)
+
+            residual = x - self.mean
+
+            # Keep the covariance floor anchored to calibration.
+            if not hasattr(self, "covariance_floor"):
+                initial_min_eig = float(
+                    np.linalg.eigvalsh(self.covariance).min()
+                )
+                self.covariance_floor = max(
+                    1e-6, initial_min_eig * 0.10
+                )
+
+            # Effective integration rate is deliberately bounded.
+            alpha = min(float(eta), 0.05)
+
+            # Exponentially weighted mean update.
+            new_mean = self.mean + alpha * residual
+
+            # Weighted covariance update around the updated mean.
+            new_covariance = (
+                (1.0 - alpha) * self.covariance
+                + alpha * (1.0 - alpha)
+                * np.outer(residual, residual)
+            )
+
+            new_covariance = 0.5 * (
+                new_covariance + new_covariance.T
+            )
+
+            # Project onto a positive-definite covariance matrix.
+            eigenvalues, eigenvectors = np.linalg.eigh(new_covariance)
+            eigenvalues = np.maximum(
+                eigenvalues, self.covariance_floor
+            )
+
+            new_covariance = (
+                eigenvectors
+                @ np.diag(eigenvalues)
+                @ eigenvectors.T
+            )
+
+            new_covariance = 0.5 * (
+                new_covariance + new_covariance.T
+            )
+
+            if (
+                np.all(np.isfinite(new_mean))
+                and np.all(np.isfinite(new_covariance))
+                and np.linalg.eigvalsh(new_covariance).min() >= self.covariance_floor * 0.999
+            ):
+                self.mean = new_mean
+                self.covariance = new_covariance
+
+                self.model.mean = self.mean.copy()
+                self.model.covariance = self.covariance.copy()
+
+                self.adaptations += 1
+                adaptation_applied = True
+            else:
+                reasons.append("UPDATE_REJECTED")
+
+        if alarm:
+            self.alarms += 1
+
+        if not reasons:
+            reasons.append("CLEAN_ADAPT" if adaptation_applied else "CLEAN_HOLD")
+
+        return EngineResult(
+            sample=int(packet.sample),
+            score=score,
+            threshold=self.threshold,
+            alarm=alarm,
+            telemetry_valid=telemetry_valid,
+            adaptation_allowed=adaptation_allowed,
+            adaptation_applied=adaptation_applied,
+            eta=eta,
+            firmware_gate=int(packet.firmware_gate),
+            reason="|".join(reasons),
+        )
+
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\communication\protocols\packet_parser.py
+===========================================================================
+"""Parser for S.P.E.C.T.R.A. ESP32 telemetry packets."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+
+@dataclass(frozen=True)
+class SpectraPacket:
+    sample: int
+    timestamp_ms: int
+    interval_ms: int
+    mode: int
+    source: int
+    fault: int
+    firmware_gate: int
+    firmware_m2: float
+    firmware_eigenvalue: float
+    firmware_alpha: float
+    background_level: float
+    channels: tuple[float, float, float, float, float, float]
+    raw: str
+
+    @property
+    def timestamp_seconds(self) -> float:
+        return self.timestamp_ms / 1000.0
+
+    @property
+    def interval_seconds(self) -> float:
+        return self.interval_ms / 1000.0
+
+
+class PacketParseError(ValueError):
+    """Raised when a DATA packet is malformed."""
+
+
+def parse_packet(line: str) -> SpectraPacket | None:
+    """Parse one serial line. Return None for non-DATA messages."""
+
+    if not isinstance(line, str):
+        raise PacketParseError("Input must be a string")
+
+    raw = line.strip()
+
+    if not raw:
+        return None
+
+    fields = [field.strip() for field in raw.split(",")]
+
+    if fields[0] != "DATA":
+        return None
+
+    if len(fields) != 18:
+        raise PacketParseError(
+            f"Expected 18 fields, received {len(fields)}"
+        )
+
+    try:
+        sample = int(fields[1])
+        timestamp_ms = int(fields[2])
+        interval_ms = int(fields[3])
+
+        mode = int(fields[4])
+        source = int(fields[5])
+        fault = int(fields[6])
+        firmware_gate = int(fields[7])
+
+        diagnostics = [float(value) for value in fields[8:12]]
+        channels = tuple(float(value) for value in fields[12:18])
+
+    except (ValueError, OverflowError) as exc:
+        raise PacketParseError(
+            f"Invalid numeric field: {exc}"
+        ) from exc
+
+    if sample < 0 or timestamp_ms < 0:
+        raise PacketParseError("Sample and timestamp must be non-negative")
+
+    if interval_ms <= 0:
+        raise PacketParseError("Sampling interval must be positive")
+
+    if mode not in (0, 1):
+        raise PacketParseError("Mode must be 0 or 1")
+
+    if source not in (0, 1) or fault not in (0, 1):
+        raise PacketParseError("Source and fault flags must be 0 or 1")
+
+    if firmware_gate not in (0, 1, 2):
+        raise PacketParseError("Unknown firmware gate status")
+
+    if not all(math.isfinite(value) for value in diagnostics + list(channels)):
+        raise PacketParseError("Packet contains non-finite values")
+
+    if any(value < 0 for value in channels):
+        raise PacketParseError("Channel observations cannot be negative")
+
+    if diagnostics[0] < 0 or diagnostics[1] < 0:
+        raise PacketParseError("Firmware M2/eigenvalue cannot be negative")
+
+    if not 0.0 <= diagnostics[2] <= 1.0:
+        raise PacketParseError("Firmware alpha must be between 0 and 1")
+
+    if diagnostics[3] < 0:
+        raise PacketParseError("Background level cannot be negative")
+
+    return SpectraPacket(
+        sample=sample,
+        timestamp_ms=timestamp_ms,
+        interval_ms=interval_ms,
+        mode=mode,
+        source=source,
+        fault=fault,
+        firmware_gate=firmware_gate,
+        firmware_m2=diagnostics[0],
+        firmware_eigenvalue=diagnostics[1],
+        firmware_alpha=diagnostics[2],
+        background_level=diagnostics[3],
+        channels=channels,
+        raw=raw,
+    )
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\communication\serial\serial_reader.py
+===========================================================================
+"""USB serial reader for the S.P.E.C.T.R.A. ESP32."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+
+import serial
+from serial import SerialException
+
+from communication.protocols.packet_parser import (
+    PacketParseError,
+    SpectraPacket,
+    parse_packet,
+)
+
+
+class SpectraSerialReader:
+    """Read and parse telemetry from an ESP32 serial connection."""
+
+    def __init__(
+        self,
+        port: str = "COM4",
+        baudrate: int = 115200,
+        timeout: float = 1.0,
+    ) -> None:
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.connection: serial.Serial | None = None
+        self.parse_errors = 0
+        self.ignored_lines = 0
+        self.received_packets = 0
+        self.last_sample: int | None = None
+        self.last_timestamp_ms: int | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connection is not None and self.connection.is_open
+
+    def connect(self) -> None:
+        """Open the serial port."""
+        if self.is_connected:
+            return
+
+        try:
+            self.connection = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=self.timeout,
+            )
+            # Allow the ESP32 serial interface to settle after opening.
+            time.sleep(1.5)
+            self.connection.reset_input_buffer()
+            print(
+                f"[SPECTRA] Connected to {self.port} "
+                f"at {self.baudrate} baud"
+            )
+        except SerialException as exc:
+            self.connection = None
+            raise ConnectionError(
+                f"Could not open {self.port}. "
+                "Close Arduino Serial Monitor and check the USB connection."
+            ) from exc
+
+    def read_packet(self) -> SpectraPacket | None:
+        """Read one line and return a valid telemetry packet."""
+        if not self.is_connected:
+            raise ConnectionError("Serial reader is not connected")
+
+        try:
+            raw_line = self.connection.readline()
+
+            if not raw_line:
+                return None
+
+            line = raw_line.decode("utf-8", errors="replace").strip()
+
+            try:
+                packet = parse_packet(line)
+            except PacketParseError as exc:
+                self.parse_errors += 1
+                print(f"[SPECTRA] Rejected packet: {exc}")
+                return None
+
+            if packet is None:
+                self.ignored_lines += 1
+                return None
+
+            if self.last_sample is not None:
+                if packet.sample <= self.last_sample:
+                    self.parse_errors += 1
+                    print("[SPECTRA] Rejected non-increasing sample counter")
+                    return None
+
+            if self.last_timestamp_ms is not None:
+                if packet.timestamp_ms <= self.last_timestamp_ms:
+                    self.parse_errors += 1
+                    print("[SPECTRA] Rejected non-increasing timestamp")
+                    return None
+
+            self.last_sample = packet.sample
+            self.last_timestamp_ms = packet.timestamp_ms
+            self.received_packets += 1
+
+            return packet
+
+        except SerialException as exc:
+            raise ConnectionError(
+                f"Serial communication with {self.port} failed"
+            ) from exc
+
+    def stream(self) -> Iterator[SpectraPacket]:
+        """Yield valid packets continuously until interrupted."""
+        if not self.is_connected:
+            self.connect()
+
+        while self.is_connected:
+            packet = self.read_packet()
+            if packet is not None:
+                yield packet
+
+    def close(self) -> None:
+        """Close the serial connection safely."""
+        if self.connection is not None:
+            if self.connection.is_open:
+                self.connection.close()
+
+            self.connection = None
+            print(f"[SPECTRA] Disconnected from {self.port}")
+
+    def __enter__(self) -> "SpectraSerialReader":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\spectra_app\algorithms\calibration.py
+===========================================================================
+"""Hardware-in-the-loop baseline calibration for S.P.E.C.T.R.A."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from rad_daes.background.model import BackgroundModel
+
+
+def build_background_model(
+    samples,
+    covariance_shrinkage: float = 0.10,
+    covariance_floor: float = 1e-6,
+    covariance_floor_fraction: float = 0.25,
+) -> BackgroundModel:
+    """Build a regularized six-channel model from clean baseline samples."""
+
+    x = np.asarray(samples, dtype=float)
+
+    if x.ndim != 2 or x.shape[1] != 6:
+        raise ValueError("Expected samples with shape (n, 6)")
+
+    if x.shape[0] < 30:
+        raise ValueError("At least 30 baseline samples are required")
+
+    if not np.all(np.isfinite(x)):
+        raise ValueError("Baseline contains non-finite observations")
+
+    if np.any(x < 0):
+        raise ValueError("Channel observations cannot be negative")
+
+    if not 0.0 <= covariance_shrinkage <= 1.0:
+        raise ValueError("Shrinkage must be between 0 and 1")
+
+    mean = np.mean(x, axis=0)
+    empirical_covariance = np.cov(x, rowvar=False, ddof=1)
+
+    diagonal = np.diag(np.diag(empirical_covariance))
+
+    covariance = (
+        (1.0 - covariance_shrinkage) * empirical_covariance
+        + covariance_shrinkage * diagonal
+    )
+
+    channel_floors = np.maximum(
+        covariance_floor,
+        covariance_floor_fraction * mean,
+    )
+
+    current_diagonal = np.diag(covariance).copy()
+    required_diagonal = np.maximum(current_diagonal, channel_floors)
+
+    covariance += np.diag(required_diagonal - current_diagonal)
+    covariance = 0.5 * (covariance + covariance.T)
+
+    return BackgroundModel(
+        mean=mean,
+        covariance=covariance,
+    )
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\S.P.E.C.T.R.A\tools\capture_baseline.py
+===========================================================================
+"""Capture a clean synthetic HIL baseline for S.P.E.C.T.R.A."""
+
+from __future__ import annotations
+
+import csv
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+
+from communication.serial.serial_reader import SpectraSerialReader
+from spectra_app.algorithms.calibration import build_background_model
+
+SAMPLE_COUNT = 120
+WARMUP_COUNT = 12
+PORT = "COM4"
+BAUD = 115200
+MIN_INTERVAL_MS = 750
+MAX_INTERVAL_MS = 1350
+MAX_REJECTED_PACKETS = 60
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parents[1]
+    raw_dir = root / "data" / "raw"
+    processed_dir = root / "data" / "processed"
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    baseline_path = raw_dir / f"baseline_{stamp}.csv"
+    rejected_path = raw_dir / f"baseline_rejected_{stamp}.csv"
+    model_path = processed_dir / f"background_model_{stamp}.npz"
+
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    warmup_seen = 0
+    total_seen = 0
+
+    reader = SpectraSerialReader(PORT, BAUD, timeout=3.0)
+
+    print("\n========== S.P.E.C.T.R.A. BASELINE CAPTURE ==========")
+    print(f"Port: {PORT} | Baud: {BAUD}")
+    print(f"Startup warm-up: {WARMUP_COUNT} packets")
+    print(f"Required clean baseline: {SAMPLE_COUNT} packets")
+    print("Keep source and fault injection OFF.")
+    print("Keep DAES mode ON.\n")
+
+    try:
+        reader.connect()
+
+        while len(accepted) < SAMPLE_COUNT:
+            packet = reader.read_packet()
+
+            if packet is None:
+                continue
+
+            total_seen += 1
+
+            if packet.mode != 1 or packet.source != 0 or packet.fault != 0:
+                raise RuntimeError(
+                    "Unsafe capture state: expected DAES mode ON, "
+                    "source OFF and fault OFF. Capture aborted."
+                )
+
+            if not MIN_INTERVAL_MS <= packet.interval_ms <= MAX_INTERVAL_MS:
+                rejected.append({
+                    "sample": packet.sample,
+                    "reason": "invalid_timing",
+                    "firmware_gate": packet.firmware_gate,
+                    "interval_ms": packet.interval_ms,
+                    **{f"W{i}": packet.channels[i] for i in range(6)},
+                })
+                print(
+                    f"[REJECT] Sample {packet.sample}: "
+                    f"invalid interval {packet.interval_ms} ms"
+                )
+                continue
+
+            if warmup_seen < WARMUP_COUNT:
+                warmup_seen += 1
+                print(
+                    f"[WARMUP {warmup_seen:02d}/{WARMUP_COUNT}] "
+                    f"Sample={packet.sample} | Gate={packet.firmware_gate}"
+                )
+                continue
+
+            if packet.firmware_gate != 0:
+                rejected.append({
+                    "sample": packet.sample,
+                    "reason": f"firmware_gate_{packet.firmware_gate}",
+                    "firmware_gate": packet.firmware_gate,
+                    "interval_ms": packet.interval_ms,
+                    **{f"W{i}": packet.channels[i] for i in range(6)},
+                })
+                print(
+                    f"[REJECT] Sample {packet.sample}: "
+                    f"firmware gate={packet.firmware_gate}"
+                )
+
+                if len(rejected) > MAX_REJECTED_PACKETS:
+                    raise RuntimeError(
+                        "Too many rejected packets. Firmware integrity "
+                        "is unstable; refusing to calibrate."
+                    )
+                continue
+
+            record = {
+                "sample": packet.sample,
+                "timestamp_ms": packet.timestamp_ms,
+                "interval_ms": packet.interval_ms,
+                "firmware_gate": packet.firmware_gate,
+                "firmware_m2": packet.firmware_m2,
+                "firmware_eigenvalue": packet.firmware_eigenvalue,
+                "firmware_alpha": packet.firmware_alpha,
+                "background_level": packet.background_level,
+            }
+
+            for i in range(6):
+                record[f"W{i}"] = packet.channels[i]
+
+            accepted.append(record)
+
+            print(
+                f"[BASELINE {len(accepted):03d}/{SAMPLE_COUNT}] "
+                f"Sample={packet.sample} | "
+                f"Channels={packet.channels}"
+            )
+
+    except KeyboardInterrupt:
+        print("\nCapture interrupted. No model will be generated.")
+        return 1
+
+    except Exception as exc:
+        print(f"\nCAPTURE FAILED: {exc}")
+        return 1
+
+    finally:
+        reader.close()
+
+    if len(accepted) != SAMPLE_COUNT:
+        print("Incomplete baseline. No model generated.")
+        return 1
+
+    with baseline_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=accepted[0].keys())
+        writer.writeheader()
+        writer.writerows(accepted)
+
+    if rejected:
+        with rejected_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=rejected[0].keys())
+            writer.writeheader()
+            writer.writerows(rejected)
+
+    samples = np.asarray(
+        [[row[f"W{i}"] for i in range(6)] for row in accepted],
+        dtype=float,
+    )
+
+    model = build_background_model(samples)
+
+    eigenvalues = np.linalg.eigvalsh(model.covariance)
+
+    if not np.all(np.isfinite(model.mean)):
+        raise RuntimeError("Generated mean contains non-finite values.")
+
+    if not np.all(np.isfinite(model.covariance)):
+        raise RuntimeError("Generated covariance contains non-finite values.")
+
+    if eigenvalues.min() <= 0:
+        raise RuntimeError("Generated covariance is not positive definite.")
+
+    np.savez(
+        model_path,
+        mean=model.mean,
+        covariance=model.covariance,
+        sample_count=len(accepted),
+        channels=6,
+        source="synthetic_poisson_hil_baseline",
+        created_at=stamp,
+    )
+
+    print("\n========== BASELINE COMPLETE ==========")
+    print("Accepted samples:", len(accepted))
+    print("Warm-up packets:", warmup_seen)
+    print("Rejected packets:", len(rejected))
+    print("Mean:", np.round(model.mean, 4))
+    print("Covariance diagonal:", np.round(np.diag(model.covariance), 4))
+    print("Minimum covariance eigenvalue:", float(eigenvalues.min()))
+    print("Baseline CSV:", baseline_path)
+    print("Background model:", model_path)
+
+    if rejected:
+        print("Rejected-packet audit:", rejected_path)
+
+    print("\nNOTE: This is a synthetic HIL baseline, not a physical")
+    print("radiation-background calibration or a validated FAR estimate.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\rad-daes\configs\model.yaml
+===========================================================================
+# Model and algorithm configuration.
+# DAES parameters follow the original implementation where applicable.
+daes:
+  gain: 0.35                 # gamma in eta = gamma / ((1+safety) * lambda_hat)
+  safety: 0.10               # s in the original rule
+  power_iterations: 7
+  tracker_alpha: 0.16
+  tracker_alpha_max: 0.82
+  drift_sensitivity: 7.0
+  initial_vector: [0.83, 0.41, 0.37, 0.29, 0.23, 0.19]
+
+background:
+  covariance_forgetting: 0.02
+  covariance_shrinkage: 0.10
+  covariance_floor: 1.0e-6
+  covariance_floor_fraction: 0.25   # diagonal floor as a fraction of nominal Poisson variance
+  initial_covariance: "diagonal_poisson"   # diag(mu_0)
+
+gate:
+  window: 10
+  fano_min: 0.25
+  fano_max: 3.50
+  max_dt_seconds: 1.50
+  innovation_quantile: 0.999
+  innovation_floor: 10.0
+  drift_patience: 90          # consecutive innovation exceedances before release
+
+detector:
+  epsilon: 1.0e-6
+  target_far_per_hour: 1.0
+  calibration_seconds: 21600
+
+baselines:
+  ewma_alpha: 0.02
+  rls_forgetting: 0.995
+  adam_learning_rate: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  static_covariance: "diagonal_poisson"
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\rad-daes\src\rad_daes\adaptation\daes.py
+===========================================================================
+"""Original DAES scalar step-size controller.
+
+The equations here are a faithful re-implementation of the supplied
+``drift_aware_eigen_scaling.py`` tracker. See ``docs/daes_interface.md``.
+
+DAES does not update a matrix. It returns a scalar step size for a caller-supplied
+curvature matrix. Rad-DAES supplies ``H = Sigma^{-1}`` and applies the step to the
+background mean.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class DAESStep:
+    eta: float
+    raw_rayleigh: float
+    filtered_lambda: float
+    drift_score: float
+    alpha: float
+
+
+class DAESController:
+    """Drift-aware eigenvalue step-size heuristic.
+
+    Parameters mirror the original implementation. ``gain`` is the original ``gamma``;
+    ``safety`` is the original ``s``.
+    """
+
+    def __init__(
+        self,
+        gain: float = 1.78,
+        safety: float = 0.10,
+        power_iterations: int = 7,
+        tracker_alpha: float = 0.16,
+        tracker_alpha_max: float = 0.82,
+        drift_sensitivity: float = 7.0,
+        initial_vector: np.ndarray | list[float] | None = None,
+    ) -> None:
+        if gain <= 0:
+            raise ValueError("gain must be positive")
+        if safety < 0:
+            raise ValueError("safety must be non-negative")
+        if power_iterations < 1:
+            raise ValueError("power_iterations must be at least 1")
+        if not (0.0 < tracker_alpha <= tracker_alpha_max <= 1.0):
+            raise ValueError("require 0 < tracker_alpha <= tracker_alpha_max <= 1")
+        if drift_sensitivity < 0:
+            raise ValueError("drift_sensitivity must be non-negative")
+
+        self.gain = float(gain)
+        self.safety = float(safety)
+        self.power_iterations = int(power_iterations)
+        self.tracker_alpha = float(tracker_alpha)
+        self.tracker_alpha_max = float(tracker_alpha_max)
+        self.drift_sensitivity = float(drift_sensitivity)
+        self._initial_vector = None if initial_vector is None else np.asarray(initial_vector, dtype=float)
+        self._vector: np.ndarray | None = None
+        self._estimate: float | None = None
+        self._previous_raw: float | None = None
+
+    def reset(self, curvature: np.ndarray, initial_vector: np.ndarray | None = None) -> None:
+        """Reset the tracker. The vector is normalized and stored."""
+
+        h = self._validate_curvature(curvature)
+        vector = initial_vector if initial_vector is not None else self._initial_vector
+        if vector is None:
+            vector = np.ones(h.shape[0], dtype=float)
+        vector = np.asarray(vector, dtype=float).ravel()
+        if vector.shape != (h.shape[0],):
+            raise ValueError("initial_vector has the wrong dimension")
+        norm = float(np.linalg.norm(vector))
+        if norm <= 0:
+            raise ValueError("initial_vector must be non-zero")
+        self._vector = vector / norm
+        self._estimate = None
+        self._previous_raw = None
+
+    def step(self, curvature: np.ndarray) -> DAESStep:
+        """Consume one curvature matrix and return the scalar step and diagnostics."""
+
+        h = self._validate_curvature(curvature)
+        if self._vector is None or self._vector.shape != (h.shape[0],):
+            self.reset(h)
+
+        assert self._vector is not None
+        for _ in range(self.power_iterations):
+            candidate = h @ self._vector
+            norm = float(np.linalg.norm(candidate))
+            if norm <= 0.0:
+                break
+            self._vector = candidate / norm
+
+        raw = float(self._vector @ h @ self._vector)
+
+        if self._estimate is None:
+            self._estimate = raw
+            self._previous_raw = raw
+            drift = 0.0
+            alpha = self.tracker_alpha
+            filtered = raw
+        else:
+            assert self._previous_raw is not None
+            drift = abs(raw - self._previous_raw) / max(abs(self._previous_raw), 1e-12)
+            alpha = float(
+                np.clip(
+                    self.tracker_alpha + self.drift_sensitivity * drift,
+                    self.tracker_alpha,
+                    self.tracker_alpha_max,
+                )
+            )
+            filtered = (1.0 - alpha) * self._estimate + alpha * raw
+            # The original implementation never lets the filtered estimate lag below a
+            # newly observed upward Rayleigh quotient.
+            if raw > self._estimate:
+                filtered = max(filtered, raw)
+            self._estimate = float(filtered)
+            self._previous_raw = raw
+
+        eta = self.gain / ((1.0 + self.safety) * max(float(self._estimate), 1e-12))
+        return DAESStep(
+            eta=float(eta),
+            raw_rayleigh=raw,
+            filtered_lambda=float(self._estimate),
+            drift_score=float(drift),
+            alpha=float(alpha),
+        )
+
+    @property
+    def estimate(self) -> float | None:
+        return self._estimate
+
+    @staticmethod
+    def _validate_curvature(curvature: np.ndarray) -> np.ndarray:
+        h = np.asarray(curvature, dtype=float)
+        if h.ndim != 2 or h.shape[0] != h.shape[1]:
+            raise ValueError("curvature must be a square matrix")
+        if not np.all(np.isfinite(h)):
+            raise ValueError("curvature contains non-finite values")
+        # Symmetrize to protect the Rayleigh quotient from tiny numerical asymmetry.
+        return 0.5 * (h + h.T)
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\rad-daes\src\rad_daes\telemetry\gate.py
+===========================================================================
+"""Four-condition telemetry-integrity gate."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    passed: bool
+    valid: bool
+    timing: bool
+    poisson: bool
+    innovation: bool
+    sustained_override: bool
+    fano: np.ndarray
+    dt: float
+
+
+class TelemetryGate:
+    """Validity, timing, Poisson-dispersion, and innovation checks.
+
+    The gate is deliberately separate from the detector: an observation can be a genuine
+    source (alarm) and still be rejected for model updating. The evaluation reports both
+    decisions separately.
+
+    A sustained-exceedance release prevents a deadlock under a persistent background step:
+    after ``drift_patience`` consecutive innovation exceedances, the innovation condition is
+    released while the other three telemetry conditions still apply. This is a design choice,
+    not part of the original planning document. The patience is deliberately longer than the
+    longest synthetic source event (60 s) so a single source event cannot trigger it.
+    """
+
+    def __init__(
+        self,
+        window: int = 10,
+        fano_min: float = 0.25,
+        fano_max: float = 3.50,
+        max_dt_seconds: float = 1.50,
+        min_dt_seconds: float = 0.50,
+        innovation_threshold: float = 22.46,
+        drift_patience: int = 90,
+    ) -> None:
+        if window < 2:
+            raise ValueError("window must be at least 2")
+        if not (0.0 <= fano_min < fano_max):
+            raise ValueError("require 0 <= fano_min < fano_max")
+        if min_dt_seconds <= 0 or max_dt_seconds <= min_dt_seconds:
+            raise ValueError("require 0 < min_dt < max_dt")
+        if innovation_threshold <= 0:
+            raise ValueError("innovation_threshold must be positive")
+        if drift_patience < 1:
+            raise ValueError("drift_patience must be at least 1")
+
+        self.window = int(window)
+        self.fano_min = float(fano_min)
+        self.fano_max = float(fano_max)
+        self.max_dt_seconds = float(max_dt_seconds)
+        self.min_dt_seconds = float(min_dt_seconds)
+        self.innovation_threshold = float(innovation_threshold)
+        self.drift_patience = int(drift_patience)
+        self._buffer: deque[np.ndarray] = deque(maxlen=self.window)
+        self._previous_t: float | None = None
+        self._exceedance_run = 0
+
+    def reset(self, innovation_threshold: float | None = None) -> None:
+        self._buffer.clear()
+        self._previous_t = None
+        self._exceedance_run = 0
+        if innovation_threshold is not None:
+            self.innovation_threshold = float(innovation_threshold)
+
+    def set_threshold(self, innovation_threshold: float) -> None:
+        if innovation_threshold <= 0:
+            raise ValueError("innovation_threshold must be positive")
+        self.innovation_threshold = float(innovation_threshold)
+
+    def evaluate(self, x: np.ndarray, t_obs: float, score: float) -> GateDecision:
+        x = np.asarray(x, dtype=float).ravel()
+        if x.ndim != 1:
+            raise ValueError("observation must be a vector")
+
+        valid = bool(np.all(np.isfinite(x)) and np.all(x > 0.0))
+
+        if self._previous_t is None:
+            timing = True
+            dt = float("nan")
+        else:
+            dt = float(t_obs - self._previous_t)
+            timing = bool(
+                np.isfinite(dt)
+                and self.min_dt_seconds <= dt <= self.max_dt_seconds
+            )
+        self._previous_t = float(t_obs)
+
+        self._buffer.append(x.copy())
+        if len(self._buffer) < self.window:
+            poisson = False
+            fano = np.full(x.shape, np.nan)
+        else:
+            buffer = np.vstack(self._buffer)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                means = buffer.mean(axis=0)
+                variances = buffer.var(axis=0, ddof=1)
+                fano = variances / means
+            poisson = bool(
+                np.all(np.isfinite(fano))
+                and np.all(fano >= self.fano_min)
+                and np.all(fano <= self.fano_max)
+            )
+
+        innovation = bool(np.isfinite(score) and score <= self.innovation_threshold)
+        if not (valid and timing and poisson):
+            # A telemetry fault is not evidence of a persistent background shift.
+            self._exceedance_run = 0
+        elif innovation:
+            self._exceedance_run = 0
+        else:
+            self._exceedance_run += 1
+        sustained_override = bool(self._exceedance_run >= self.drift_patience)
+        innovation_ok = bool(innovation or sustained_override)
+        passed = bool(valid and timing and poisson and innovation_ok)
+        return GateDecision(
+            passed=passed,
+            valid=valid,
+            timing=timing,
+            poisson=poisson,
+            innovation=innovation,
+            sustained_override=sustained_override,
+            fano=np.asarray(fano, dtype=float),
+            dt=dt,
+        )
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\rad-daes\src\rad_daes\background\model.py
+===========================================================================
+"""Background mean/covariance state and its numerical helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass
+class BackgroundModel:
+    """A Gaussian background state with a full covariance matrix."""
+
+    mean: np.ndarray
+    covariance: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.mean = np.asarray(self.mean, dtype=float).copy()
+        self.covariance = np.asarray(self.covariance, dtype=float).copy()
+        if self.mean.ndim != 1:
+            raise ValueError("mean must be a vector")
+        d = self.mean.shape[0]
+        if self.covariance.shape != (d, d):
+            raise ValueError("covariance must be D x D")
+        if not np.all(np.isfinite(self.mean)) or not np.all(np.isfinite(self.covariance)):
+            raise ValueError("background state contains non-finite values")
+        self.covariance = 0.5 * (self.covariance + self.covariance.T)
+
+    @property
+    def dimension(self) -> int:
+        return int(self.mean.shape[0])
+
+    def copy(self) -> "BackgroundModel":
+        return BackgroundModel(self.mean.copy(), self.covariance.copy())
+
+    def precision(self, epsilon: float = 1e-6) -> np.ndarray:
+        """Return ``(covariance + epsilon I)^{-1}``."""
+
+        if epsilon < 0:
+            raise ValueError("epsilon must be non-negative")
+        d = self.dimension
+        matrix = self.covariance + epsilon * np.eye(d)
+        # Symmetrize before inversion; the covariance update already does this.
+        matrix = 0.5 * (matrix + matrix.T)
+        return np.linalg.inv(matrix)
+
+    def score(self, x: np.ndarray, epsilon: float = 1e-6) -> float:
+        """Pre-update Mahalanobis score ``r^T (Sigma + eps I)^{-1} r``."""
+
+        x = np.asarray(x, dtype=float).ravel()
+        if x.shape != self.mean.shape:
+            raise ValueError("observation has the wrong dimension")
+        if not np.all(np.isfinite(x)):
+            return float("nan")
+        residual = x - self.mean
+        precision = self.precision(epsilon)
+        return float(residual @ precision @ residual)
+
+    def update_mean(self, delta: np.ndarray) -> None:
+        delta = np.asarray(delta, dtype=float).ravel()
+        if delta.shape != self.mean.shape:
+            raise ValueError("mean update has the wrong dimension")
+        if not np.all(np.isfinite(delta)):
+            raise ValueError("mean update contains non-finite values")
+        self.mean = self.mean + delta
+
+    def update_covariance(
+        self,
+        x: np.ndarray,
+        beta: float = 0.02,
+        shrinkage: float = 0.10,
+        floor: float | np.ndarray = 1e-6,
+    ) -> None:
+        """EWMA covariance update with diagonal shrinkage and a positive floor.
+
+        Uses the post-update residual ``u = x - mean``. ``floor`` may be a scalar or a
+        per-window vector; a vector floor can keep the diagonal at or above a physically
+        motivated Poisson variance.
+        """
+
+        if not (0.0 < beta <= 1.0):
+            raise ValueError("beta must be in (0, 1]")
+        if not (0.0 <= shrinkage <= 1.0):
+            raise ValueError("shrinkage must be in [0, 1]")
+        x = np.asarray(x, dtype=float).ravel()
+        if x.shape != self.mean.shape:
+            raise ValueError("observation has the wrong dimension")
+        if not np.all(np.isfinite(x)):
+            raise ValueError("covariance update requires a finite observation")
+        floor_array = np.asarray(floor, dtype=float)
+        if floor_array.ndim == 0:
+            floor_array = np.full(x.shape, float(floor_array))
+        if floor_array.shape != x.shape:
+            raise ValueError("floor must be a scalar or have one entry per window")
+        if not np.all(np.isfinite(floor_array)) or np.any(floor_array <= 0.0):
+            raise ValueError("floor entries must be positive and finite")
+
+        residual = x - self.mean
+        empirical = np.outer(residual, residual)
+        updated = (1.0 - beta) * self.covariance + beta * empirical
+        updated = (1.0 - shrinkage) * updated + shrinkage * np.diag(np.diag(updated))
+        updated = 0.5 * (updated + updated.T)
+        # Floor the diagonal rather than adding a constant at every update; repeated
+        # addition would slowly inflate the covariance over long streams.
+        diag = np.maximum(np.diag(updated), floor_array)
+        np.fill_diagonal(updated, diag)
+        self.covariance = updated
+
+    def relative_error(self, true_mean: np.ndarray) -> np.ndarray:
+        true_mean = np.asarray(true_mean, dtype=float).ravel()
+        if true_mean.shape != self.mean.shape:
+            raise ValueError("true_mean has the wrong dimension")
+        return np.abs(self.mean - true_mean) / np.maximum(np.abs(true_mean), 1e-12)
+
+
+===========================================================================
+FILE: C:\Users\chaya\OneDrive\Documents\Default Project\rad-daes\src\rad_daes\detection\detector.py
+===========================================================================
+"""Pre-update Mahalanobis detector with a two-sample persistence rule."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from rad_daes.background.model import BackgroundModel
+
+
+class MahalanobisDetector:
+    """Score first, update later.
+
+    The detector never sees the updated background for the current sample. This preserves
+    the planning document's "detect first, adapt second" ordering.
+    """
+
+    def __init__(self, threshold: float = 22.46, persistence: int = 2, epsilon: float = 1e-6) -> None:
+        if threshold <= 0:
+            raise ValueError("threshold must be positive")
+        if persistence < 1:
+            raise ValueError("persistence must be at least 1")
+        if epsilon < 0:
+            raise ValueError("epsilon must be non-negative")
+        self.threshold = float(threshold)
+        self.persistence = int(persistence)
+        self.epsilon = float(epsilon)
+        self._consecutive = 0
+
+    def reset(self, threshold: float | None = None) -> None:
+        self._consecutive = 0
+        if threshold is not None:
+            self.set_threshold(threshold)
+
+    def set_threshold(self, threshold: float) -> None:
+        if threshold <= 0:
+            raise ValueError("threshold must be positive")
+        self.threshold = float(threshold)
+
+    def score(self, x: np.ndarray, model: BackgroundModel) -> float:
+        return model.score(x, epsilon=self.epsilon)
+
+    def update(self, score: float) -> int:
+        if not np.isfinite(score):
+            self._consecutive = 0
+            return 0
+        if score > self.threshold:
+            self._consecutive += 1
+        else:
+            self._consecutive = 0
+        return int(self._consecutive >= self.persistence)
+
+    @staticmethod
+    def threshold_for_far(scores: np.ndarray, target_far_per_hour: float, dt_seconds: float = 1.0) -> float:
+        """Empirical threshold for a target per-sample false-alarm rate.
+
+        The persistence rule can only reduce the realised rate; this threshold is the
+        single-sample quantile, not a guarantee for the two-sample alarm.
+        """
+
+        if target_far_per_hour <= 0:
+            raise ValueError("target_far_per_hour must be positive")
+        if dt_seconds <= 0:
+            raise ValueError("dt_seconds must be positive")
+        values = np.asarray(scores, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError("no finite scores to calibrate")
+        alpha = min(max(target_far_per_hour * dt_seconds / 3600.0, 0.0), 1.0)
+        quantile = 1.0 - alpha
+        return float(np.quantile(values, quantile))
+

@@ -1,0 +1,65 @@
+{
+  "project": "S.P.E.C.T.R.A. / RAD-DAES",
+  "classification": "SYNTHETIC_POISSON_HARDWARE_IN_THE_LOOP",
+  "port": "/dev/ttyUSB0",
+  "baud": 115200,
+  "samples_per_stage_target": 12,
+  "completed": true,
+  "samples_recorded": 90,
+  "engine_processed": 90,
+  "adaptations": 39,
+  "alarms": 12,
+  "stage_sample_counts": {
+    "CLEAN_DAES": 12,
+    "SOURCE_INJECTION": 12,
+    "SOURCE_RECOVERY": 12,
+    "FAULT_INJECTION": 12,
+    "FAULT_RECOVERY": 12,
+    "STATIC_MODE": 12,
+    "DAES_RECOVERY": 12
+  },
+  "stage_adaptation_counts": {
+    "CLEAN_DAES": 12,
+    "SOURCE_RECOVERY": 2,
+    "FAULT_RECOVERY": 10,
+    "DAES_RECOVERY": 12
+  },
+  "stage_mismatch_counts": {
+    "SOURCE_INJECTION": 1,
+    "SOURCE_RECOVERY": 1,
+    "FAULT_INJECTION": 1,
+    "FAULT_RECOVERY": 1,
+    "STATIC_MODE": 1,
+    "DAES_RECOVERY": 1
+  },
+  "stage_observed": {
+    "CLEAN_DAES": true,
+    "SOURCE_INJECTION": true,
+    "SOURCE_RECOVERY": true,
+    "FAULT_INJECTION": true,
+    "FAULT_RECOVERY": true,
+    "STATIC_MODE": true,
+    "DAES_RECOVERY": true
+  },
+  "automated_checks": {
+    "all_seven_stages_observed": true,
+    "no_adaptation_during_injection_or_static": true,
+    "covariance_positive_definite_for_all_samples": true,
+    "adaptation_observed_in_clean_and_recovered_DAES": true,
+    "live_test_completed_without_manual_interruption": true
+  },
+  "unsafe_adaptation_rows": 0,
+  "non_positive_covariance_rows": 0,
+  "serial_parse_errors": 0,
+  "serial_ignored_lines": 0,
+  "final_covariance_min_eigenvalue": 3.348790270320115,
+  "final_mean": [
+    26.018397296443286,
+    20.838678641572905,
+    12.631322034104906,
+    9.474032087012613,
+    6.550801435176256,
+    4.093951540185373
+  ],
+  "scientific_limitations": "Synthetic Poisson HIL only. No physical radiation sensor measurements, field validation, detection-accuracy claim, or validated false-alarm rate."
+}
